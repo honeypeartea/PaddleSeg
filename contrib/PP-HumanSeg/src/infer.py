@@ -121,6 +121,59 @@ class Predictor:
 
         return self.postprocess(output, img, data, bg)
 
+    def run_lumo(self, y_limit, img, bg):
+        # add y_limit for masking
+        input_names = self.predictor.get_input_names()
+        input_handle = self.predictor.get_input_handle(input_names[0])
+
+        data = self.compose({'img': img})
+        input_data = np.array([data['img']])
+
+        input_handle.reshape(input_data.shape)
+        input_handle.copy_from_cpu(input_data)
+        if self.args.test_speed:
+            start = time.time()
+
+        self.predictor.run()
+
+        if self.args.test_speed:
+            self.cost_averager.record(time.time() - start)
+        output_names = self.predictor.get_output_names()
+        output_handle = self.predictor.get_output_handle(output_names[0])
+        output = output_handle.copy_to_cpu()
+
+        trans_info = data['trans_info']
+        score_map = output[0, 1, :, :]
+
+        # support post process only
+        if self.args.use_post_process:
+            mask_original = score_map.copy()
+            mask_original = (mask_original * 255).astype("uint8")
+            _, mask_thr = cv2.threshold(mask_original, 240, 1,
+                                        cv2.THRESH_BINARY)
+            kernel_erode = cv2.getStructuringElement(cv2.MORPH_CROSS, (5, 5))
+            kernel_dilate = cv2.getStructuringElement(cv2.MORPH_CROSS, (25, 25))
+            mask_erode = cv2.erode(mask_thr, kernel_erode)
+            mask_dilate = cv2.dilate(mask_erode, kernel_dilate)
+            score_map *= mask_dilate
+
+        score_map = score_map[np.newaxis, np.newaxis, ...]
+        score_map = reverse_transform(
+            paddle.to_tensor(score_map), trans_info, mode='bilinear')
+        alpha = np.transpose(score_map.numpy().squeeze(1), [1, 2, 0])
+
+        h, w, _ = img.shape
+        bg = cv2.resize(bg, (w, h))
+        if bg.ndim == 2:
+            bg = bg[..., np.newaxis]
+
+        temp = (alpha * img + (1 - alpha) * bg).astype(np.uint8)
+        out = img.copy()
+        out[:y_limit,:,:] = temp[:y_limit,:,:]
+
+        return out
+
+
     def postprocess(self, pred_img, origin_img, data, bg):
         trans_info = data['trans_info']
         score_map = pred_img[0, 1, :, :]
